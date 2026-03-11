@@ -1,0 +1,16 @@
+{
+  "name": "lola-brain",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "ingest": "bun run src/ingest.ts",
+    "seed-graph": "bun run src/seed-graph.ts",
+    "query": "bun run src/query.ts",
+    "api": "bun run src/api.ts"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.24.0",
+    "neo4j-driver": "^5.27.0",
+    "@qdrant/js-client-rest": "^1.12.0"
+  }
+}
