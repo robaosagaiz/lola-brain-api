@@ -563,7 +563,15 @@ function estimateKcal(
   function findZone(hr: number): ZoneData {
     const adj = hr * hrMult;
     for (const z of zones) { if (adj >= z.fc_min && adj <= z.fc_max) return z; }
-    return adj < zones[0].fc_min ? zones[0] : zones[zones.length - 1];
+    // If HR falls in a gap between zones, find the closest zone boundary
+    if (adj < zones[0].fc_min) return zones[0];
+    let closest = zones[0];
+    let minDist = Infinity;
+    for (const z of zones) {
+      const dist = Math.min(Math.abs(adj - z.fc_min), Math.abs(adj - z.fc_max));
+      if (dist < minDist) { minDist = dist; closest = z; }
+    }
+    return closest;
   }
 
   let breakdown: { zone: ZoneData; minutes: number }[];
