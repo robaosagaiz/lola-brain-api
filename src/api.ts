@@ -554,10 +554,19 @@ function estimateKcal(
   }
 
   const { zones } = cpet;
+  // Cross-modal HR correction (~10% difference between bike and treadmill)
+  // Same metabolic load → bike FC is ~10% lower than treadmill FC
+  // So: bike FC ÷ 0.9 = equivalent treadmill FC (to look up in treadmill zones)
+  //     treadmill FC × 0.9 = equivalent bike FC (to look up in bike zones)
   let hrMult = 1.0;
-  if (activity.type === "bike" && cpet.ergometro === "esteira") {
-    hrMult = 1 / 0.9;
-    notes.push("FC ajustada: teste em esteira, treino em bike (FC÷0.9)");
+  const isBikeActivity = ["bike", "ciclismo", "pedal", "spinning"].includes(activity.type);
+  const isTreadActivity = ["corrida", "caminhada", "esteira", "trail"].includes(activity.type);
+  if (isBikeActivity && cpet.ergometro === "esteira") {
+    hrMult = 1 / 0.9; // elevate bike FC to compare with treadmill zones
+    notes.push("FC ajustada: CPET em esteira, treino em bike (FC÷0.9 para comparar com zonas)");
+  } else if (isTreadActivity && cpet.ergometro === "bike") {
+    hrMult = 0.9; // lower treadmill FC to compare with bike zones
+    notes.push("FC ajustada: CPET em bike, treino em esteira (FC×0.9 para comparar com zonas)");
   }
 
   function findZone(hr: number): ZoneData {
