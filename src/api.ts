@@ -371,13 +371,14 @@ const server = Bun.serve({
     // POST /has-cpet — Check if patient has CPET data in Neo4j
     if (url.pathname === "/has-cpet" && req.method === "POST") {
       const body = await req.json();
-      const { patientName } = body;
-      if (!patientName) return Response.json({ error: "patientName required" }, { status: 400 });
+      const { patientName, grupoId } = body;
+      if (!patientName && !grupoId) return Response.json({ error: "patientName or grupoId required" }, { status: 400 });
 
       try {
-        const cpet = await fetchCPETFromNeo4j(patientName);
+        const cpet = await fetchCPETFromNeo4j(patientName, grupoId);
         return Response.json({
-          patientName,
+          patientName: patientName || cpet.resolvedName,
+          grupoId: grupoId || null,
           hasCPET: cpet.hasCPET,
           testDate: cpet.testDate,
           vo2max: cpet.vo2max,
@@ -391,14 +392,15 @@ const server = Bun.serve({
     // POST /estimate-kcal — Estimate activity calories using CPET zones
     if (url.pathname === "/estimate-kcal" && req.method === "POST") {
       const body = await req.json();
-      const { patientName, type, durationMin, avgHR, maxHR, avgSpeed } = body;
-      if (!patientName || !type || !durationMin) {
-        return Response.json({ error: "patientName, type, and durationMin required" }, { status: 400 });
+      const { patientName, grupoId, type, durationMin, avgHR, maxHR, avgSpeed } = body;
+      if ((!patientName && !grupoId) || !type || !durationMin) {
+        return Response.json({ error: "(patientName or grupoId), type, and durationMin required" }, { status: 400 });
       }
 
       try {
-        const cpet = await fetchCPETFromNeo4j(patientName);
-        const result = estimateKcal(patientName, { type, durationMin, avgHR, maxHR, avgSpeed }, cpet);
+        const cpet = await fetchCPETFromNeo4j(patientName, grupoId);
+        const resolvedName = patientName || cpet.resolvedName || grupoId;
+        const result = estimateKcal(resolvedName, { type, durationMin, avgHR, maxHR, avgSpeed }, cpet);
         return Response.json(result);
       } catch (e: any) {
         return Response.json({ error: e.message }, { status: 500 });
@@ -408,7 +410,7 @@ const server = Bun.serve({
     // POST /query-brain — Semantic search in patient brain (for chatbot agents)
     if (url.pathname === "/query-brain" && req.method === "POST") {
       const body = await req.json();
-      const { patientName, query: q, limit: lim = 5, patient_id } = body;
+      const { patientName, grupoId, query: q, limit: lim = 5, patient_id } = body;
       if (!q) return Response.json({ error: "query required" }, { status: 400 });
 
       try {
@@ -416,7 +418,9 @@ const server = Bun.serve({
         const vector = await embed(searchQuery);
 
         const filter: any = { must: [] };
-        if (patient_id) {
+        if (grupoId) {
+          filter.must.push({ key: "grupo_id", match: { value: grupoId } });
+        } else if (patient_id) {
           filter.must.push({ key: "patient_id", match: { value: patient_id } });
         } else if (patientName) {
           filter.must.push({ key: "patient_name", match: { value: patientName } });
@@ -476,6 +480,7 @@ interface ZoneData {
 
 interface CPETResult {
   hasCPET: boolean;
+  resolvedName?: string;
   testDate?: string;
   vo2max?: number;
   classificacao?: string;
@@ -484,17 +489,34 @@ interface CPETResult {
   zones: ZoneData[];
 }
 
-async function fetchCPETFromNeo4j(patientName: string): Promise<CPETResult> {
+async function resolvePatientId(grupoId?: string, patientName?: string): Promise<{ matchField: string; matchValue: string } | null> {
+  // Priority: grupoId > patientName (grupoId is unique, name can have duplicates)
+  if (grupoId) return { matchField: "grupo_id", matchValue: grupoId };
+  if (patientName) return { matchField: "nome", matchValue: patientName };
+  return null;
+}
+
+async function fetchCPETFromNeo4j(patientName?: string, grupoId?: string): Promise<CPETResult> {
   try {
-    const result = await runQuery(`
-      MATCH (p:Paciente {nome: $nome})-[:REALIZOU_EXAME]->(e:Exame {tipo: "TCPE"})
-      OPTIONAL MATCH (e)-[:TEM_ZONA]->(z:ZonaTreino)
-      RETURN e.data as data, e.vo2max as vo2max, e.classificacao as classificacao,
-             e.ergometro as ergometro, e.fat_max_fc as fatMaxFc,
-             z.numero as zNum, z.nome as zNome, z.fc_min as zFcMin, z.fc_max as zFcMax,
-             z.speed_min as zSpeedMin, z.speed_max as zSpeedMax, z.kcal_hora as zKcalH
-      ORDER BY e.data DESC, z.numero ASC
-    `, { nome: patientName });
+    // grupoId is preferred (unique), patientName is fallback (may have duplicates)
+    const query = grupoId
+      ? `MATCH (p:Paciente {grupo_id: $val})-[:REALIZOU_EXAME]->(e:Exame {tipo: "TCPE"})
+         OPTIONAL MATCH (e)-[:TEM_ZONA]->(z:ZonaTreino)
+         RETURN p.nome as patientName, e.data as data, e.vo2max as vo2max, e.classificacao as classificacao,
+                e.ergometro as ergometro, e.fat_max_fc as fatMaxFc,
+                z.numero as zNum, z.nome as zNome, z.fc_min as zFcMin, z.fc_max as zFcMax,
+                z.speed_min as zSpeedMin, z.speed_max as zSpeedMax, z.kcal_hora as zKcalH
+         ORDER BY e.data DESC, z.numero ASC`
+      : `MATCH (p:Paciente {nome: $val})-[:REALIZOU_EXAME]->(e:Exame {tipo: "TCPE"})
+         OPTIONAL MATCH (e)-[:TEM_ZONA]->(z:ZonaTreino)
+         RETURN p.nome as patientName, e.data as data, e.vo2max as vo2max, e.classificacao as classificacao,
+                e.ergometro as ergometro, e.fat_max_fc as fatMaxFc,
+                z.numero as zNum, z.nome as zNome, z.fc_min as zFcMin, z.fc_max as zFcMax,
+                z.speed_min as zSpeedMin, z.speed_max as zSpeedMax, z.kcal_hora as zKcalH
+         ORDER BY e.data DESC, z.numero ASC`;
+
+    const val = grupoId || patientName;
+    const result = await runQuery(query, { val });
 
     if (result.records.length === 0) return { hasCPET: false, zones: [] };
 
@@ -520,6 +542,7 @@ async function fetchCPETFromNeo4j(patientName: string): Promise<CPETResult> {
 
     return {
       hasCPET: true,
+      resolvedName: first.get("patientName"),
       testDate: first.get("data"),
       vo2max: first.get("vo2max")?.toNumber ? first.get("vo2max").toNumber() : first.get("vo2max"),
       classificacao: first.get("classificacao"),
