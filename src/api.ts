@@ -550,7 +550,8 @@ async function fetchCPETFromNeo4j(patientName?: string, grupoId?: string): Promi
       fatMaxFc: first.get("fatMaxFc")?.toNumber ? first.get("fatMaxFc").toNumber() : first.get("fatMaxFc"),
       zones,
     };
-  } catch {
+  } catch (err) {
+    console.error("[fetchCPETFromNeo4j] Error:", err);
     return { hasCPET: false, zones: [] };
   }
 }
