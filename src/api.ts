@@ -364,8 +364,257 @@ const server = Bun.serve({
       return Response.json(stats);
     }
     
-    return Response.json({ error: "not found", routes: ["/health", "/search", "/cypher", "/stats"] }, { status: 404 });
+    // ============================================================
+    // CPET TOOLS — Kcal Estimator & Query Brain (for n8n agents)
+    // ============================================================
+
+    // POST /has-cpet — Check if patient has CPET data in Neo4j
+    if (url.pathname === "/has-cpet" && req.method === "POST") {
+      const body = await req.json();
+      const { patientName } = body;
+      if (!patientName) return Response.json({ error: "patientName required" }, { status: 400 });
+
+      try {
+        const cpet = await fetchCPETFromNeo4j(patientName);
+        return Response.json({
+          patientName,
+          hasCPET: cpet.hasCPET,
+          testDate: cpet.testDate,
+          vo2max: cpet.vo2max,
+          zones: cpet.zones.length,
+        });
+      } catch (e: any) {
+        return Response.json({ error: e.message }, { status: 500 });
+      }
+    }
+
+    // POST /estimate-kcal — Estimate activity calories using CPET zones
+    if (url.pathname === "/estimate-kcal" && req.method === "POST") {
+      const body = await req.json();
+      const { patientName, type, durationMin, avgHR, maxHR, avgSpeed } = body;
+      if (!patientName || !type || !durationMin) {
+        return Response.json({ error: "patientName, type, and durationMin required" }, { status: 400 });
+      }
+
+      try {
+        const cpet = await fetchCPETFromNeo4j(patientName);
+        const result = estimateKcal(patientName, { type, durationMin, avgHR, maxHR, avgSpeed }, cpet);
+        return Response.json(result);
+      } catch (e: any) {
+        return Response.json({ error: e.message }, { status: 500 });
+      }
+    }
+
+    // POST /query-brain — Semantic search in patient brain (for chatbot agents)
+    if (url.pathname === "/query-brain" && req.method === "POST") {
+      const body = await req.json();
+      const { patientName, query: q, limit: lim = 5, patient_id } = body;
+      if (!q) return Response.json({ error: "query required" }, { status: 400 });
+
+      try {
+        const searchQuery = patientName ? `${patientName} ${q}` : q;
+        const vector = await embed(searchQuery);
+
+        const filter: any = { must: [] };
+        if (patient_id) {
+          filter.must.push({ key: "patient_id", match: { value: patient_id } });
+        } else if (patientName) {
+          filter.must.push({ key: "patient_name", match: { value: patientName } });
+        }
+
+        const results = await qdrantClient.search(PATIENT_COLLECTION, {
+          vector,
+          limit: lim,
+          with_payload: true,
+          ...(filter.must.length > 0 ? { filter } : {}),
+        });
+
+        const cpetTypes = ["cpet-analise", "cpet-prescricao", "cpet-periodizacao", "analise_cpet"];
+        const hasCPET = results.some(r => {
+          const st = (r.payload as any).source_type || (r.payload as any).type;
+          return st && cpetTypes.includes(st);
+        });
+        const cpetDate = results.find(r => {
+          const st = (r.payload as any).source_type || (r.payload as any).type;
+          return st && cpetTypes.includes(st);
+        })?.payload as any;
+
+        return Response.json({
+          success: true,
+          patientName: patientName || null,
+          query: q,
+          results: results.map(r => ({
+            score: r.score,
+            text: (r.payload as any).text,
+            source_type: (r.payload as any).source_type,
+            topic: (r.payload as any).topic,
+            date: (r.payload as any).date,
+          })),
+          resultCount: results.length,
+          hasCPET,
+          cpetDate: cpetDate?.date || null,
+        });
+      } catch (e: any) {
+        return Response.json({ error: e.message }, { status: 500 });
+      }
+    }
+
+    return Response.json({ error: "not found", routes: ["/health", "/search", "/cypher", "/stats", "/estimate-kcal", "/has-cpet", "/query-brain", "/patient-search", "/patient-ingest", "/patient-stats"] }, { status: 404 });
   },
 });
+
+// ============================================================
+// CPET Kcal Estimation (inline — no external dependency)
+// ============================================================
+
+interface ZoneData {
+  numero: number; nome: string;
+  fc_min: number; fc_max: number;
+  speed_min: number; speed_max: number;
+  kcal_hora: number;
+}
+
+interface CPETResult {
+  hasCPET: boolean;
+  testDate?: string;
+  vo2max?: number;
+  classificacao?: string;
+  ergometro?: string;
+  fatMaxFc?: number;
+  zones: ZoneData[];
+}
+
+async function fetchCPETFromNeo4j(patientName: string): Promise<CPETResult> {
+  try {
+    const result = await runQuery(`
+      MATCH (p:Paciente {nome: $nome})-[:REALIZOU_EXAME]->(e:Exame {tipo: "TCPE"})
+      OPTIONAL MATCH (e)-[:TEM_ZONA]->(z:ZonaTreino)
+      RETURN e.data as data, e.vo2max as vo2max, e.classificacao as classificacao,
+             e.ergometro as ergometro, e.fat_max_fc as fatMaxFc,
+             z.numero as zNum, z.nome as zNome, z.fc_min as zFcMin, z.fc_max as zFcMax,
+             z.speed_min as zSpeedMin, z.speed_max as zSpeedMax, z.kcal_hora as zKcalH
+      ORDER BY e.data DESC, z.numero ASC
+    `, { nome: patientName });
+
+    if (result.records.length === 0) return { hasCPET: false, zones: [] };
+
+    const first = result.records[0];
+    const zones: ZoneData[] = result.records
+      .filter(r => r.get("zNum") != null)
+      .map(r => ({
+        numero: r.get("zNum")?.toNumber ? r.get("zNum").toNumber() : r.get("zNum"),
+        nome: r.get("zNome"),
+        fc_min: r.get("zFcMin")?.toNumber ? r.get("zFcMin").toNumber() : r.get("zFcMin"),
+        fc_max: r.get("zFcMax")?.toNumber ? r.get("zFcMax").toNumber() : r.get("zFcMax"),
+        speed_min: r.get("zSpeedMin")?.toNumber ? r.get("zSpeedMin").toNumber() : r.get("zSpeedMin"),
+        speed_max: r.get("zSpeedMax")?.toNumber ? r.get("zSpeedMax").toNumber() : r.get("zSpeedMax"),
+        kcal_hora: r.get("zKcalH")?.toNumber ? r.get("zKcalH").toNumber() : r.get("zKcalH"),
+      }))
+      .reduce((acc: ZoneData[], z) => {
+        if (!acc.find(a => a.numero === z.numero)) acc.push(z);
+        return acc;
+      }, [])
+      .sort((a, b) => a.numero - b.numero);
+
+    if (zones.length === 0) return { hasCPET: false, zones: [] };
+
+    return {
+      hasCPET: true,
+      testDate: first.get("data"),
+      vo2max: first.get("vo2max")?.toNumber ? first.get("vo2max").toNumber() : first.get("vo2max"),
+      classificacao: first.get("classificacao"),
+      ergometro: first.get("ergometro"),
+      fatMaxFc: first.get("fatMaxFc")?.toNumber ? first.get("fatMaxFc").toNumber() : first.get("fatMaxFc"),
+      zones,
+    };
+  } catch {
+    return { hasCPET: false, zones: [] };
+  }
+}
+
+function estimateKcal(
+  patientName: string,
+  activity: { type: string; durationMin: number; avgHR?: number; maxHR?: number; avgSpeed?: number },
+  cpet: CPETResult,
+) {
+  const notes: string[] = [];
+
+  if (!cpet.hasCPET) {
+    const mets: Record<string, number> = { caminhada: 3.5, corrida: 8, bike: 6.5, natacao: 7, crossfit: 8, funcional: 5, musculacao: 4, eliptico: 5, outro: 5 };
+    const met = mets[activity.type] || 5;
+    const totalKcal = Math.round(met * 3.5 * 75 / 200 * activity.durationMin);
+    return {
+      success: true, patientName, usedCPET: false, testDate: null, activity,
+      totalKcal, fatKcal: Math.round(totalKcal * 0.4), choKcal: Math.round(totalKcal * 0.6),
+      fatGrams: Math.round(totalKcal * 0.4 / 9), breakdown: [],
+      dominantZone: "N/A", intensity: "estimado",
+      notes: ["Paciente sem CPET — estimativa genérica baseada em METs populacionais (peso assumido 75kg)"],
+      summary: `${activity.type} ${activity.durationMin}min: ~${totalKcal} kcal (estimativa genérica — sem CPET)`,
+    };
+  }
+
+  const { zones } = cpet;
+  let hrMult = 1.0;
+  if (activity.type === "bike" && cpet.ergometro === "esteira") {
+    hrMult = 1 / 0.9;
+    notes.push("FC ajustada: teste em esteira, treino em bike (FC÷0.9)");
+  }
+
+  function findZone(hr: number): ZoneData {
+    const adj = hr * hrMult;
+    for (const z of zones) { if (adj >= z.fc_min && adj <= z.fc_max) return z; }
+    return adj < zones[0].fc_min ? zones[0] : zones[zones.length - 1];
+  }
+
+  let breakdown: { zone: ZoneData; minutes: number }[];
+
+  if (activity.avgHR) {
+    const main = findZone(activity.avgHR);
+    if (activity.maxHR && activity.maxHR > activity.avgHR + 15) {
+      breakdown = [
+        { zone: findZone(activity.avgHR - 10), minutes: activity.durationMin * 0.2 },
+        { zone: main, minutes: activity.durationMin * 0.6 },
+        { zone: findZone(Math.min(activity.avgHR + 15, activity.maxHR)), minutes: activity.durationMin * 0.2 },
+      ];
+      notes.push("Distribuição estimada: 60% zona média, 20% abaixo, 20% acima");
+    } else {
+      breakdown = [{ zone: main, minutes: activity.durationMin }];
+    }
+  } else if (activity.avgSpeed) {
+    const z = zones.reduce((best, z) => {
+      const mid = (z.speed_min + z.speed_max) / 2;
+      return Math.abs(mid - activity.avgSpeed!) < Math.abs((best.speed_min + best.speed_max) / 2 - activity.avgSpeed!) ? z : best;
+    }, zones[0]);
+    breakdown = [{ zone: z, minutes: activity.durationMin }];
+    notes.push("Zona estimada pela velocidade (sem FC)");
+  } else {
+    const defaults: Record<string, number> = { caminhada: 0, corrida: 1, crossfit: 2, funcional: 2 };
+    const idx = Math.min(defaults[activity.type] ?? 1, zones.length - 1);
+    breakdown = [{ zone: zones[idx], minutes: activity.durationMin }];
+    notes.push("Sem FC/velocidade — zona estimada pelo tipo de atividade");
+  }
+
+  const result = breakdown.map(b => {
+    const kcal = Math.round(b.zone.kcal_hora / 60 * b.minutes);
+    const fatPct = b.zone.numero === 1 ? 60 : b.zone.numero === 2 ? 35 : b.zone.numero === 3 ? 15 : 5;
+    return {
+      zone: `Z${b.zone.numero} (${b.zone.nome})`, minutes: Math.round(b.minutes),
+      kcal, fuelMix: fatPct > 50 ? "Gordura predominante" : fatPct > 25 ? "Misto" : "CHO predominante", fatPct,
+    };
+  });
+
+  const totalKcal = result.reduce((s, r) => s + r.kcal, 0);
+  const fatKcal = result.reduce((s, r) => s + Math.round(r.kcal * r.fatPct / 100), 0);
+  const dominant = result.reduce((max, r) => r.minutes > max.minutes ? r : max, result[0]);
+  const avgZone = breakdown.reduce((s, b) => s + b.zone.numero * b.minutes, 0) / activity.durationMin;
+  const intensity = avgZone < 1.5 ? "Leve" : avgZone < 2.5 ? "Moderado" : avgZone < 3.5 ? "Intenso" : "Muito intenso";
+
+  return {
+    success: true, patientName, usedCPET: true, testDate: cpet.testDate || null, activity,
+    totalKcal, fatKcal, choKcal: totalKcal - fatKcal, fatGrams: Math.round(fatKcal / 9 * 10) / 10,
+    breakdown: result, dominantZone: dominant.zone, intensity, notes,
+    summary: `${activity.type} ${activity.durationMin}min${activity.avgHR ? ` (FC ${activity.avgHR})` : ""}: ${totalKcal} kcal (${Math.round(fatKcal / 9)}g gordura). Intensidade: ${intensity}. [CPET ${cpet.testDate}]`,
+  };
+}
 
 console.log(`🧠 Lola Brain API running on http://localhost:${PORT}`);
