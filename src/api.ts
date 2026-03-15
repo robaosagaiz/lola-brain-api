@@ -427,6 +427,150 @@ const server = Bun.serve({
       }
     }
 
+    // POST /analyze-workout — Full workout analysis with formatted message (for Cora/agents)
+    if (url.pathname === "/analyze-workout" && req.method === "POST") {
+      const body = await req.json();
+      const { grupoId, patientName, segments, deviceKcal, date, patientFirstName } = body;
+      if ((!grupoId && !patientName) || !segments || !Array.isArray(segments) || segments.length === 0) {
+        return Response.json({ error: "(grupoId or patientName), segments[] required. Each segment: {type, durationMin, avgHR?, maxHR?}" }, { status: 400 });
+      }
+
+      try {
+        const cpet = await fetchCPETFromNeo4j(patientName, grupoId);
+        const resolvedName = patientName || cpet.resolvedName || "Paciente";
+        const firstName = patientFirstName || resolvedName.split(" ")[0];
+
+        // Estimate each segment
+        const segResults = segments.map((seg: any) => estimateKcal(resolvedName, {
+          type: seg.type, durationMin: seg.durationMin, avgHR: seg.avgHR, maxHR: seg.maxHR, avgSpeed: seg.avgSpeed,
+        }, cpet));
+
+        // Totals
+        const totalKcal = segResults.reduce((s: number, r: any) => s + r.totalKcal, 0);
+        const totalFatKcal = segResults.reduce((s: number, r: any) => s + r.fatKcal, 0);
+        const totalFatG = Math.round(totalFatKcal / 9 * 10) / 10;
+        const totalMin = segments.reduce((s: number, seg: any) => s + seg.durationMin, 0);
+
+        // Dominant zone (from largest segment)
+        const largestSeg = segResults.reduce((max: any, r: any, i: number) =>
+          segments[i].durationMin > (segments[max.idx]?.durationMin || 0) ? { idx: i, r } : max, { idx: 0, r: segResults[0] });
+        const dominantZone = largestSeg.r.dominantZone || "N/A";
+
+        // Average intensity
+        const avgZoneNum = segResults.reduce((s: number, r: any, i: number) => {
+          const zNum = r.breakdown?.[0]?.zone?.match(/Z(\d)/)?.[1];
+          return s + (Number(zNum) || 2) * segments[i].durationMin;
+        }, 0) / totalMin;
+        const intensity = avgZoneNum < 1.5 ? "Leve" : avgZoneNum < 2.5 ? "Moderada" : avgZoneNum < 3.5 ? "Intensa" : "Muito intensa";
+
+        // Emoji map
+        const emojiMap: Record<string, string> = {
+          bike: "🚴", ciclismo: "🚴", pedal: "🚴", spinning: "🚴",
+          corrida: "🏃", caminhada: "🚶", esteira: "🏃", trail: "🏃",
+          musculacao: "🏋️", funcional: "🏋️", crossfit: "💪",
+          natacao: "🏊", alongamento: "🧘", yoga: "🧘",
+          abdominais: "🏋️", abs: "🏋️",
+        };
+
+        // Format date
+        const dias = ["Domingo", "Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado"];
+        let dateStr = "";
+        if (date) {
+          const d = new Date(date + "T12:00:00");
+          const dia = dias[d.getDay()];
+          dateStr = `${dia}, ${d.getDate().toString().padStart(2, "0")}/${(d.getMonth() + 1).toString().padStart(2, "0")}`;
+        }
+
+        // Build message
+        const lines: string[] = [];
+        lines.push(`📊 *Análise do Treino de Hoje — ${firstName}*`);
+        if (dateStr) lines.push(`\n${dateStr}`);
+        lines.push("\n━━━━━━━━━━━━━━━━━━\n");
+
+        // Each segment
+        for (let i = 0; i < segments.length; i++) {
+          const seg = segments[i];
+          const res = segResults[i];
+          const emoji = emojiMap[seg.type] || "🏃";
+          const typeName = seg.type.charAt(0).toUpperCase() + seg.type.slice(1);
+
+          if (seg.durationMin >= 15) {
+            // Detailed segment
+            lines.push(`${emoji} *${typeName} (${seg.durationMin} min)*`);
+            if (seg.avgHR) lines.push(`• FC média: ${seg.avgHR} bpm${seg.maxHR ? ` | máx: ${seg.maxHR} bpm` : ""}`);
+            lines.push(`• Gasto: *${res.totalKcal} kcal*`);
+            lines.push(`• Gordura oxidada: *${res.fatGrams}g*`);
+            if (res.dominantZone && res.dominantZone !== "N/A") {
+              lines.push(`• Zona dominante: ${res.dominantZone}`);
+            }
+            lines.push("");
+          } else {
+            // Short segment (one line)
+            lines.push(`${emoji} *${typeName} (${seg.durationMin} min)* → *${res.totalKcal} kcal*`);
+          }
+        }
+
+        lines.push("━━━━━━━━━━━━━━━━━━\n");
+        lines.push("📈 *Resumo*");
+        lines.push(`• Total: *${totalKcal} kcal* | Gordura: *~${Math.round(totalFatG)}g*`);
+
+        if (deviceKcal) {
+          const diff = Math.round((deviceKcal / totalKcal - 1) * 100);
+          if (diff > 10) {
+            lines.push(`• Relógio marcou: ${deviceKcal} kcal (superestimou ~${diff}%)`);
+          } else if (diff < -10) {
+            lines.push(`• Relógio marcou: ${deviceKcal} kcal (subestimou ~${Math.abs(diff)}%)`);
+          } else {
+            lines.push(`• Relógio marcou: ${deviceKcal} kcal (próximo do real ✅)`);
+          }
+        }
+
+        lines.push(`• Intensidade geral: ${intensity}`);
+
+        // Phase-aware tip
+        if (cpet.hasCPET) {
+          const fatmaxFc = cpet.fatMaxFc;
+          const mainSeg = segments.reduce((max: any, s: any) => s.durationMin > (max.durationMin || 0) ? s : max, segments[0]);
+          if (mainSeg.avgHR && fatmaxFc) {
+            const diff = Math.abs(mainSeg.avgHR - fatmaxFc);
+            if (diff <= 10) {
+              lines.push(`\n💡 FC média de ${mainSeg.avgHR} está perto do FATmax (FC ~${fatmaxFc}) — máxima oxidação de gordura.`);
+            } else if (mainSeg.avgHR < fatmaxFc) {
+              lines.push(`\n💡 FC média de ${mainSeg.avgHR} está abaixo do FATmax (FC ~${fatmaxFc}). Pode aumentar levemente a intensidade para otimizar queima de gordura.`);
+            } else {
+              lines.push(`\n💡 FC média de ${mainSeg.avgHR} está acima do FATmax (FC ~${fatmaxFc}). Bom para condicionamento, mas a oxidação de gordura é menor nessa faixa.`);
+            }
+          }
+        }
+
+        const message = lines.join("\n");
+
+        return Response.json({
+          success: true,
+          patientName: resolvedName,
+          usedCPET: cpet.hasCPET,
+          testDate: cpet.testDate,
+          totalKcal,
+          totalFatG,
+          totalMin,
+          deviceKcal: deviceKcal || null,
+          deviceDiff: deviceKcal ? Math.round((deviceKcal / totalKcal - 1) * 100) : null,
+          intensity,
+          dominantZone,
+          segments: segResults.map((r: any, i: number) => ({
+            type: segments[i].type,
+            durationMin: segments[i].durationMin,
+            kcal: r.totalKcal,
+            fatG: r.fatGrams,
+            zone: r.dominantZone,
+          })),
+          message,
+        });
+      } catch (e: any) {
+        return Response.json({ error: e.message }, { status: 500 });
+      }
+    }
+
     // POST /query-brain — Semantic search in patient brain (for chatbot agents)
     if (url.pathname === "/query-brain" && req.method === "POST") {
       const body = await req.json();
