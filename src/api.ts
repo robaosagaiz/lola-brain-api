@@ -7,6 +7,7 @@ import { extractEntities, upsertEntities } from "./entity-extractor.ts";
 import { upsertPatientGraph } from "./patient-graph.ts";
 import { embed } from "./embeddings.ts";
 import crypto from "crypto";
+import { appendTreinosRows, findWeekForDate, readTreinos, readSessoes, readPeriodizacao } from "./sheets.ts";
 
 const PORT = 3005;
 
@@ -430,7 +431,7 @@ const server = Bun.serve({
     // POST /analyze-workout — Full workout analysis with formatted message (for Cora/agents)
     if (url.pathname === "/analyze-workout" && req.method === "POST") {
       const body = await req.json();
-      const { grupoId, patientName, segments, deviceKcal, date, patientFirstName } = body;
+      const { grupoId, patientName, segments, deviceKcal, date, patientFirstName, save = true, fonte = "manual" } = body;
       if ((!grupoId && !patientName) || !segments || !Array.isArray(segments) || segments.length === 0) {
         return Response.json({ error: "(grupoId or patientName), segments[] required. Each segment: {type, durationMin, avgHR?, maxHR?}" }, { status: 400 });
       }
@@ -545,6 +546,44 @@ const server = Bun.serve({
 
         const message = lines.join("\n");
 
+        // Auto-save to "Treinos" spreadsheet tab
+        let saved = false;
+        if (save && grupoId && date) {
+          try {
+            // Determine which week this falls into
+            const weekInfo = await findWeekForDate(grupoId, date);
+            const semanaStr = weekInfo.semana ? String(weekInfo.semana) : '';
+
+            // One row per segment
+            const rows = segments.map((seg: any, i: number) => {
+              const res = segResults[i];
+              return [
+                grupoId,
+                date,
+                seg.type,
+                String(seg.durationMin),
+                seg.avgHR ? String(seg.avgHR) : '',
+                seg.maxHR ? String(seg.maxHR) : '',
+                String(res.totalKcal),
+                String(res.fatGrams),
+                res.dominantZone || '',
+                res.intensity || intensity,
+                i === 0 && deviceKcal ? String(deviceKcal) : '', // device_kcal only on first segment
+                fonte,
+                semanaStr,
+                '', // aderente — filled by adherence check later
+                '', // notas
+              ];
+            });
+
+            await appendTreinosRows(rows);
+            saved = true;
+            console.log(`[analyze-workout] Saved ${rows.length} rows for ${grupoId} on ${date}`);
+          } catch (e: any) {
+            console.error('[analyze-workout] Save error:', e.message);
+          }
+        }
+
         return Response.json({
           success: true,
           patientName: resolvedName,
@@ -557,6 +596,7 @@ const server = Bun.serve({
           deviceDiff: deviceKcal ? Math.round((deviceKcal / totalKcal - 1) * 100) : null,
           intensity,
           dominantZone,
+          saved,
           segments: segResults.map((r: any, i: number) => ({
             type: segments[i].type,
             durationMin: segments[i].durationMin,
@@ -565,6 +605,191 @@ const server = Bun.serve({
             zone: r.dominantZone,
           })),
           message,
+        });
+      } catch (e: any) {
+        return Response.json({ error: e.message }, { status: 500 });
+      }
+    }
+
+    // POST /workout-adherence — Adherence metrics for a patient's week
+    if (url.pathname === "/workout-adherence" && req.method === "POST") {
+      const body = await req.json();
+      const { grupoId, week, startDate } = body;
+      if (!grupoId) return Response.json({ error: "grupoId required" }, { status: 400 });
+
+      try {
+        // Read periodização for this patient
+        const periodRows = await readPeriodizacao(grupoId);
+        const hasPrescription = periodRows.length > 0;
+
+        // Determine current week if not specified
+        let targetWeek = week;
+        let weekStart: string | null = null;
+        let weekEnd: string | null = null;
+
+        if (hasPrescription) {
+          if (!targetWeek) {
+            // Find current week based on today's date
+            const today = new Date().toISOString().split('T')[0];
+            const weekInfo = await findWeekForDate(grupoId, today);
+            targetWeek = weekInfo.semana || 1;
+            weekStart = weekInfo.weekStart;
+            weekEnd = weekInfo.weekEnd;
+          }
+
+          if (!weekStart || !weekEnd) {
+            // Find date range for the target week from periodização
+            const headers = Object.keys(periodRows[0] || {});
+            const weekRow = periodRows.find((r: any) => {
+              const s = parseInt(r.semana || r.Semana || '0');
+              return s === targetWeek;
+            });
+
+            if (weekRow) {
+              weekStart = weekRow.data_inicio || weekRow.inicio || null;
+              weekEnd = weekRow.data_fim || weekRow.fim || null;
+              if (weekStart && !weekEnd) {
+                const d = new Date(weekStart + 'T00:00:00');
+                d.setDate(d.getDate() + 6);
+                weekEnd = d.toISOString().split('T')[0];
+              }
+            }
+          }
+        }
+
+        // Read actual workouts
+        const treinos = await readTreinos(grupoId, weekStart || undefined, weekEnd || undefined);
+
+        // Basic summary (works with or without prescription)
+        const workoutDates = [...new Set(treinos.map((t: any) => t.data))];
+        const totalSessions = workoutDates.length;
+        const totalMin = treinos.reduce((s: number, t: any) => s + (parseFloat(t.duracao_min) || 0), 0);
+        const totalKcal = treinos.reduce((s: number, t: any) => s + (parseFloat(t.kcal) || 0), 0);
+        const totalFatG = treinos.reduce((s: number, t: any) => s + (parseFloat(t.gordura_g) || 0), 0);
+
+        // Group by type
+        const byType: Record<string, { count: number; min: number; kcal: number }> = {};
+        for (const t of treinos) {
+          const tipo = t.tipo || 'outro';
+          if (!byType[tipo]) byType[tipo] = { count: 0, min: 0, kcal: 0 };
+          byType[tipo].count++;
+          byType[tipo].min += parseFloat(t.duracao_min) || 0;
+          byType[tipo].kcal += parseFloat(t.kcal) || 0;
+        }
+
+        if (!hasPrescription) {
+          // No prescription — return summary only
+          return Response.json({
+            success: true,
+            grupoId,
+            hasPrescription: false,
+            semana: targetWeek || null,
+            periodo: weekStart && weekEnd ? { inicio: weekStart, fim: weekEnd } : null,
+            resumo: {
+              sessoes: totalSessions,
+              volumeMin: Math.round(totalMin),
+              totalKcal: Math.round(totalKcal),
+              totalFatG: Math.round(totalFatG * 10) / 10,
+              porTipo: byType,
+            },
+            treinos: treinos.map((t: any) => ({
+              data: t.data,
+              tipo: t.tipo,
+              duracao_min: parseFloat(t.duracao_min) || 0,
+              kcal: parseFloat(t.kcal) || 0,
+              fc_media: parseFloat(t.fc_media) || null,
+            })),
+          });
+        }
+
+        // Has prescription — calculate adherence
+        const sessoes = await readSessoes(grupoId, targetWeek);
+
+        // Count prescribed sessions by type
+        const prescribedByType: Record<string, { count: number; minTotal: number; fcMin?: number; fcMax?: number }> = {};
+        let totalPrescribedSessions = 0;
+        let totalPrescribedMin = 0;
+
+        for (const s of sessoes) {
+          const tipo = (s.tipo || s.atividade || 'outro').toLowerCase();
+          const dur = parseFloat(s.duracao_min || s.duracao || '0');
+          if (!prescribedByType[tipo]) prescribedByType[tipo] = { count: 0, minTotal: 0 };
+          prescribedByType[tipo].count++;
+          prescribedByType[tipo].minTotal += dur;
+          if (s.fc_min) prescribedByType[tipo].fcMin = parseFloat(s.fc_min);
+          if (s.fc_max) prescribedByType[tipo].fcMax = parseFloat(s.fc_max);
+          totalPrescribedSessions++;
+          totalPrescribedMin += dur;
+        }
+
+        // Calculate adherence percentages
+        const percentual = totalPrescribedSessions > 0
+          ? Math.round(totalSessions / totalPrescribedSessions * 100)
+          : null;
+
+        const volumePct = totalPrescribedMin > 0
+          ? Math.round(totalMin / totalPrescribedMin * 100)
+          : null;
+
+        // Per-type adherence
+        const porTipo: Record<string, { prescrito: number; realizado: number; pct: number }> = {};
+        for (const [tipo, prescribed] of Object.entries(prescribedByType)) {
+          const done = byType[tipo]?.count || 0;
+          porTipo[tipo] = {
+            prescrito: prescribed.count,
+            realizado: done,
+            pct: Math.round(done / prescribed.count * 100),
+          };
+        }
+
+        // FC adherence: % of workouts within prescribed FC range
+        let fcAderencia: number | null = null;
+        if (sessoes.length > 0) {
+          let withinRange = 0;
+          let checkedCount = 0;
+          for (const t of treinos) {
+            const fc = parseFloat(t.fc_media);
+            if (!fc) continue;
+            const tipo = t.tipo?.toLowerCase();
+            const prescribed = prescribedByType[tipo];
+            if (prescribed?.fcMin && prescribed?.fcMax) {
+              checkedCount++;
+              if (fc >= prescribed.fcMin && fc <= prescribed.fcMax) withinRange++;
+            }
+          }
+          if (checkedCount > 0) fcAderencia = Math.round(withinRange / checkedCount * 100);
+        }
+
+        return Response.json({
+          success: true,
+          grupoId,
+          hasPrescription: true,
+          semana: targetWeek,
+          periodo: weekStart && weekEnd ? { inicio: weekStart, fim: weekEnd } : null,
+          aderencia: {
+            percentual,
+            volumePct,
+            fcAderencia,
+            porTipo,
+          },
+          prescrito: {
+            sessoes: totalPrescribedSessions,
+            volumeMin: Math.round(totalPrescribedMin),
+          },
+          realizado: {
+            sessoes: totalSessions,
+            volumeMin: Math.round(totalMin),
+            totalKcal: Math.round(totalKcal),
+            totalFatG: Math.round(totalFatG * 10) / 10,
+            porTipo: byType,
+          },
+          treinos: treinos.map((t: any) => ({
+            data: t.data,
+            tipo: t.tipo,
+            duracao_min: parseFloat(t.duracao_min) || 0,
+            kcal: parseFloat(t.kcal) || 0,
+            fc_media: parseFloat(t.fc_media) || null,
+          })),
         });
       } catch (e: any) {
         return Response.json({ error: e.message }, { status: 500 });
@@ -627,7 +852,7 @@ const server = Bun.serve({
       }
     }
 
-    return Response.json({ error: "not found", routes: ["/health", "/search", "/cypher", "/stats", "/estimate-kcal", "/has-cpet", "/query-brain", "/patient-search", "/patient-ingest", "/patient-stats"] }, { status: 404 });
+    return Response.json({ error: "not found", routes: ["/health", "/search", "/cypher", "/stats", "/estimate-kcal", "/has-cpet", "/analyze-workout", "/workout-adherence", "/query-brain", "/patient-search", "/patient-ingest", "/patient-stats"] }, { status: 404 });
   },
 });
 
