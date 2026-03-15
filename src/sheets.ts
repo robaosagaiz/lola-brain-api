@@ -6,23 +6,24 @@ const SPREADSHEET_ID = '1bxZ0O4OAWH27aBiwUzEYfamG5qG1EkF_wWoLUNqtFig';
 // Auth: tries GOOGLE_SA_KEY_JSON env var (full JSON content) first,
 // then falls back to file path (GOOGLE_SA_KEY or default)
 async function getAuth() {
+  // Try 1: full JSON in env var
   const keyJson = process.env.GOOGLE_SA_KEY_JSON;
   if (keyJson) {
     const credentials = JSON.parse(keyJson);
-    const auth = new google.auth.GoogleAuth({
-      credentials,
-      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-    });
-    return auth;
+    return new google.auth.GoogleAuth({ credentials, scopes: ['https://www.googleapis.com/auth/spreadsheets'] });
+  }
+
+  // Try 2: base64-encoded JSON in env var (safer for Docker/EasyPanel)
+  const keyB64 = process.env.GOOGLE_SA_KEY_B64;
+  if (keyB64) {
+    const decoded = Buffer.from(keyB64, 'base64').toString('utf-8');
+    const credentials = JSON.parse(decoded);
+    return new google.auth.GoogleAuth({ credentials, scopes: ['https://www.googleapis.com/auth/spreadsheets'] });
   }
   
-  // Fallback to file path
+  // Try 3: file path
   const keyFile = process.env.GOOGLE_SA_KEY || '/app/service-account.json';
-  const auth = new google.auth.GoogleAuth({
-    keyFile,
-    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-  });
-  return auth;
+  return new google.auth.GoogleAuth({ keyFile, scopes: ['https://www.googleapis.com/auth/spreadsheets'] });
 }
 
 let _sheets: any = null;
