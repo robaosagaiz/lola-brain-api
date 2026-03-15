@@ -19,6 +19,26 @@ const server = Bun.serve({
     if (url.pathname === "/health") {
       return Response.json({ status: "ok", service: "lola-brain", version: "1.0.0" });
     }
+
+    // POST /send-whatsapp — relay to Evolution API (same Docker network)
+    if (url.pathname === "/send-whatsapp" && req.method === "POST") {
+      const body = await req.json();
+      const { instance, number, text, apikey } = body;
+      if (!instance || !number || !text || !apikey) {
+        return Response.json({ error: "instance, number, text, apikey required" }, { status: 400 });
+      }
+      try {
+        const evoRes = await fetch(`http://evolution-api:8080/message/sendText/${instance}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", apikey },
+          body: JSON.stringify({ number, text }),
+        });
+        const data = await evoRes.json();
+        return Response.json(data);
+      } catch (e: any) {
+        return Response.json({ error: e.message }, { status: 500 });
+      }
+    }
     
     // Hybrid search: semantic + graph
     if (url.pathname === "/search" && req.method === "POST") {
