@@ -11,6 +11,19 @@ import { appendTreinosRows, findWeekForDate, readTreinos, readSessoes, readPerio
 
 const PORT = 3005;
 
+// Deterministic UUIDv5 (RFC 4122, SHA-1) for patient-brain points keyed by content identity.
+// Namespace is a fixed constant: changing it would change every content-addressed point ID.
+const PATIENT_POINT_NAMESPACE = "6f1c2a4e-9b3d-5e7f-8a1b-2c3d4e5f6a7b";
+function patientPointUuid(patient_id: string, source_type: string, content_sha256: string, chunk_index: number): string {
+  const ns = Buffer.from(PATIENT_POINT_NAMESPACE.replace(/-/g, ""), "hex");
+  const name = Buffer.from(`${patient_id}|${source_type}|${content_sha256}|${chunk_index}`, "utf8");
+  const h = crypto.createHash("sha1").update(Buffer.concat([ns, name])).digest();
+  h[6] = (h[6] & 0x0f) | 0x50;
+  h[8] = (h[8] & 0x3f) | 0x80;
+  const hex = h.subarray(0, 16).toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
 const server = Bun.serve({
   port: PORT,
   async fetch(req) {
@@ -223,9 +236,31 @@ const server = Bun.serve({
     if (url.pathname === "/patient-ingest" && req.method === "POST") {
       const body = await req.json();
       const { text, patient_id, patient_name, source_type = "consulta", speaker, date, consultation_number, topic } = body;
+      const force = body.force === true;
       
       if (!text) return Response.json({ error: "text required" }, { status: 400 });
       if (!patient_id) return Response.json({ error: "patient_id required" }, { status: 400 });
+
+      // Optional content identity (anti-duplication). When absent, legacy behavior is kept exactly.
+      let content_sha256: string | null = null;
+      if (body.content_sha256 !== undefined && body.content_sha256 !== null && body.content_sha256 !== "") {
+        content_sha256 = String(body.content_sha256).toLowerCase();
+        if (!/^[0-9a-f]{64}$/.test(content_sha256)) {
+          return Response.json({ error: "content_sha256 must be 64 hex chars" }, { status: 400 });
+        }
+        const shaFilter = { must: [
+          { key: "patient_id", match: { value: patient_id } },
+          { key: "content_sha256", match: { value: content_sha256 } },
+        ] };
+        const existing = await qdrantClient.count(PATIENT_COLLECTION, { filter: shaFilter, exact: true });
+        if (existing.count > 0) {
+          if (!force) {
+            return Response.json({ skipped: true, reason: "already_ingested", chunks: existing.count, patient_id, content_sha256, collection: PATIENT_COLLECTION });
+          }
+          // force: drop previous chunks of this exact content so re-chunking never leaves stale points
+          await qdrantClient.delete(PATIENT_COLLECTION, { filter: shaFilter, wait: true });
+        }
+      }
       
       // Chunk by headings or paragraphs
       const lines = text.split("\n");
@@ -291,15 +326,14 @@ const server = Bun.serve({
       // Embed and upsert
       const BATCH = 20;
       let total = 0;
+      const pointIds: string[] = [];
       
       for (let i = 0; i < chunks.length; i += BATCH) {
         const batch = chunks.slice(i, i + BATCH);
         const vectors = await Promise.all(batch.map(c => embed(c.text)));
         
-        const points = batch.map((chunk, idx) => ({
-          id: crypto.createHash("md5").update(`${patient_id}:${date || ""}:${chunk.text.slice(0, 100)}`).digest("hex"),
-          vector: vectors[idx],
-          payload: {
+        const points = batch.map((chunk, idx) => {
+          const payload: Record<string, any> = {
             text: chunk.text,
             patient_id,
             patient_name: patient_name || null,
@@ -308,8 +342,19 @@ const server = Bun.serve({
             date: date || null,
             topic: topic || chunk.section || null,
             consultation_number: consultation_number || null,
-          },
-        }));
+          };
+          let id: string;
+          if (content_sha256) {
+            const chunk_index = i + idx;
+            id = patientPointUuid(patient_id, source_type, content_sha256, chunk_index);
+            payload.content_sha256 = content_sha256;
+            payload.chunk_index = chunk_index;
+            pointIds.push(id);
+          } else {
+            id = crypto.createHash("md5").update(`${patient_id}:${date || ""}:${chunk.text.slice(0, 100)}`).digest("hex");
+          }
+          return { id, vector: vectors[idx], payload };
+        });
         
         await qdrantClient.upsert(PATIENT_COLLECTION, { points });
         total += batch.length;
@@ -326,6 +371,9 @@ const server = Bun.serve({
         graphResult = { error: e.message };
       }
       
+      if (content_sha256) {
+        return Response.json({ chunks: total, patient_id, collection: PATIENT_COLLECTION, graph: graphResult, content_sha256, point_ids: pointIds, forced: force });
+      }
       return Response.json({ chunks: total, patient_id, collection: PATIENT_COLLECTION, graph: graphResult });
     }
     

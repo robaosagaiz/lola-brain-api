@@ -85,6 +85,17 @@ function extractMedicalEntities(text: string) {
   return { medicacoes: [...new Set(medicacoes)], orientacoes, exames: [...new Set(exames)], metricas };
 }
 
+// Only consultation transcripts/summaries represent an encounter. Exams, bioimpedance,
+// meal plans, administrative docs etc. must NOT create/merge Consulta nodes.
+const CONSULTATION_SOURCE_TYPES = new Set([
+  "consulta", "consulta-tratada", "consulta-bruta", "consulta-crua",
+  "transcricao", "transcricao-consulta",
+]);
+export function isConsultationSourceType(source_type?: string): boolean {
+  // Legacy default of /patient-ingest is "consulta" when source_type is omitted.
+  return CONSULTATION_SOURCE_TYPES.has((source_type || "consulta").toLowerCase());
+}
+
 export async function upsertPatientGraph(meta: ConsultationMeta, text: string) {
   const { patient_id, patient_name, date, consultation_number, source_type } = meta;
 
@@ -103,8 +114,8 @@ export async function upsertPatientGraph(meta: ConsultationMeta, text: string) {
     { patient_id }
   );
 
-  // 2. Create Consultation node (only if we have a date)
-  if (date) {
+  // 2. Create Consultation node (only if we have a date AND the source is a consultation)
+  if (date && isConsultationSourceType(source_type)) {
     const consultaId = `consulta-${patient_id}-${date}`;
     const tipo = source_type?.includes('crua') ? 'crua' : (source_type?.includes('tratada') ? 'tratada' : 'geral');
 
@@ -185,7 +196,7 @@ export async function upsertPatientGraph(meta: ConsultationMeta, text: string) {
     };
   }
 
-  return { patient_node: patient_id, consultation_node: null };
+  return { patient_node: patient_id, consultation_node: null, consultation_skipped_reason: date ? `source_type '${source_type}' is not a consultation` : "no date" };
 }
 
 // ==================== PLANO ALIMENTAR ====================
