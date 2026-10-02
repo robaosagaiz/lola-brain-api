@@ -9,9 +9,9 @@
     "api": "bun run src/api.ts"
   },
   "dependencies": {
-    "@google/generative-ai": "^0.24.0",
-    "@qdrant/js-client-rest": "^1.12.0",
-    "googleapis": "^171.4.0",
-    "neo4j-driver": "^5.27.0"
+    "@google/generative-ai": "0.24.1",
+    "@qdrant/js-client-rest": "1.17.0",
+    "googleapis": "171.4.0",
+    "neo4j-driver": "5.28.3"
   }
 }
